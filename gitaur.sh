@@ -24,6 +24,7 @@ if command -v pacman >/dev/null 2>&1; then
 fi
 
 declare -A INSTALLED_PKG_CACHE=()
+declare -A REPO_AVAIL_CACHE=()
 
 [[ $# -gt 0 ]] || usage
 
@@ -64,6 +65,46 @@ get_installed_version() {
   return 1
 }
 
+is_repo_package() {
+  local pkg="$1"
+
+  (( HAVE_PACMAN )) || return 1
+
+  if [[ -v "REPO_AVAIL_CACHE[$pkg]" ]]; then
+    [[ "${REPO_AVAIL_CACHE[$pkg]}" == yes ]]
+    return $?
+  fi
+
+  if pacman -Si -- "$pkg" >/dev/null 2>&1; then
+    REPO_AVAIL_CACHE["$pkg"]=yes
+    return 0
+  fi
+
+  REPO_AVAIL_CACHE["$pkg"]=no
+  return 1
+}
+
+format_pkg_with_status() {
+  local pkg="$1"
+  local version
+  local -a tags=()
+
+  if get_installed_version "$pkg" version; then
+    tags+=("installed: $version")
+  fi
+
+  if is_repo_package "$pkg"; then
+    tags+=("repo")
+  elif [[ -n "${AUR_BRANCH_LOOKUP[$pkg]:-}" ]]; then
+    tags+=("aur")
+  fi
+
+  if (( ${#tags[@]} )); then
+    local joined="${tags[0]}"
+    for tag in "${tags[@]:1}"; do
+      joined+=", $tag"
+    done
+    printf '%s [%s]' "$pkg" "$joined"
 format_pkg_with_status() {
   local pkg="$1"
   local version
@@ -137,6 +178,7 @@ handle_dependencies() {
 
   (( ${#deps[@]} )) || { echo "No dependencies declared in .SRCINFO."; return 0; }
 
+  local have_pacman=$HAVE_PACMAN
   local have_pacman=0
   if command -v pacman >/dev/null 2>&1; then
     have_pacman=1
@@ -151,6 +193,7 @@ handle_dependencies() {
   local -a unknown_deps=()
   local dep
   for dep in "${deps[@]}"; do
+    if (( have_pacman )) && is_repo_package "$dep"; then
     if (( have_pacman )) && pacman -Si -- "$dep" >/dev/null 2>&1; then
       repo_deps+=("$dep")
     elif [[ -n "${AUR_BRANCH_LOOKUP[$dep]:-}" ]]; then
@@ -164,18 +207,21 @@ handle_dependencies() {
   if (( ${#repo_deps[@]} )); then
     printf '  Repo (%d):\n' "${#repo_deps[@]}"
     for dep in "${repo_deps[@]}"; do
+      printf '    - %s\n' "$(format_pkg_with_status "$dep")"
       printf '    - %s\n' "$dep"
     done
   fi
   if (( ${#aur_deps[@]} )); then
     printf '  AUR (%d):\n' "${#aur_deps[@]}"
     for dep in "${aur_deps[@]}"; do
+      printf '    - %s\n' "$(format_pkg_with_status "$dep")"
       printf '    - %s\n' "$dep"
     done
   fi
   if (( ${#unknown_deps[@]} )); then
     printf '  Unknown (%d):\n' "${#unknown_deps[@]}"
     for dep in "${unknown_deps[@]}"; do
+      printf '    - %s\n' "$(format_pkg_with_status "$dep")"
       printf '    - %s\n' "$dep"
     done
   fi
