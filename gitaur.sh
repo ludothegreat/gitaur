@@ -5,6 +5,7 @@ AUR_GIT_URL="https://github.com/archlinux/aur.git"
 OUT_DIR="${AUR_CLONE_DIR:-$HOME/src/aur}"   # override with AUR_CLONE_DIR=/path
 PAGER_CMD="${PAGER:-less -R}"
 EDITOR_CMD="${EDITOR:-nano}"
+AUR_PUSH_REMOTE="${AUR_PUSH_REMOTE:-aur}"
 
 mkdir -p "$OUT_DIR"
 
@@ -25,6 +26,265 @@ readarray -t ALL_BRANCHES < <(
   | awk '{sub("refs/heads/","",$2); print $2}' | sort -f
 )
 
+declare -A AUR_BRANCH_LOOKUP=()
+for _branch in "${ALL_BRANCHES[@]}"; do
+  AUR_BRANCH_LOOKUP["$_branch"]=1
+done
+
+prepare_srcinfo() {
+  local dest="$1"
+  local __srcinfo_var="$2"
+  local __tmp_var="$3"
+  local msg="${4:-Generating .SRCINFO...}"
+
+  local srcinfo="$dest/.SRCINFO"
+  local tmp=""
+
+  if [[ ! -f "$srcinfo" ]]; then
+    echo "$msg"
+    tmp="$(mktemp)" || { echo "mktemp failed" >&2; return 1; }
+    if ! ( cd "$dest" && makepkg --printsrcinfo ) >"$tmp"; then
+      echo "Failed to generate .SRCINFO" >&2
+      rm -f "$tmp"
+      return 1
+    fi
+    srcinfo="$tmp"
+  fi
+
+  printf -v "$__srcinfo_var" '%s' "$srcinfo"
+  printf -v "$__tmp_var" '%s' "$tmp"
+}
+
+handle_dependencies() {
+  local pkg="$1"
+  local dest="$2"
+  local srcinfo=""
+  local tmp_srcinfo=""
+
+  if ! prepare_srcinfo "$dest" srcinfo tmp_srcinfo "Generating .SRCINFO to inspect dependencies..."; then
+    return 1
+  fi
+
+  local -A seen=()
+  local -a deps=()
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    if [[ -z "${seen[$dep]:-}" ]]; then
+      deps+=("$dep")
+      seen["$dep"]=1
+    fi
+  done < <(
+    awk -F' = ' '
+      $1 ~ /^(depends|makedepends|checkdepends|optdepends)$/ {
+        dep = $2
+        gsub(/#.*/, "", dep)
+        gsub(/[[:space:]]+/, "", dep)
+        sub(/:.*/, "", dep)
+        sub(/[<>=!].*/, "", dep)
+        sub(/\?.*/, "", dep)
+        if (dep != "") print dep
+      }
+    ' "$srcinfo"
+  )
+
+  if [[ -n "$tmp_srcinfo" ]]; then
+    rm -f "$tmp_srcinfo"
+  fi
+
+  (( ${#deps[@]} )) || { echo "No dependencies declared in .SRCINFO."; return 0; }
+
+  local have_pacman=0
+  if command -v pacman >/dev/null 2>&1; then
+    have_pacman=1
+  fi
+
+  if (( ! have_pacman )); then
+    echo "(pacman not found; repo availability checks skipped.)"
+  fi
+
+  local -a repo_deps=()
+  local -a aur_deps=()
+  local -a unknown_deps=()
+  local dep
+  for dep in "${deps[@]}"; do
+    if (( have_pacman )) && pacman -Si -- "$dep" >/dev/null 2>&1; then
+      repo_deps+=("$dep")
+    elif [[ -n "${AUR_BRANCH_LOOKUP[$dep]:-}" ]]; then
+      aur_deps+=("$dep")
+    else
+      unknown_deps+=("$dep")
+    fi
+  done
+
+  echo "Dependencies for $pkg:"
+  if (( ${#repo_deps[@]} )); then
+    printf '  Repo (%d):\n' "${#repo_deps[@]}"
+    for dep in "${repo_deps[@]}"; do
+      printf '    - %s\n' "$dep"
+    done
+  fi
+  if (( ${#aur_deps[@]} )); then
+    printf '  AUR (%d):\n' "${#aur_deps[@]}"
+    for dep in "${aur_deps[@]}"; do
+      printf '    - %s\n' "$dep"
+    done
+  fi
+  if (( ${#unknown_deps[@]} )); then
+    printf '  Unknown (%d):\n' "${#unknown_deps[@]}"
+    for dep in "${unknown_deps[@]}"; do
+      printf '    - %s\n' "$dep"
+    done
+  fi
+
+  if (( ! ${#repo_deps[@]} && ! ${#aur_deps[@]} && ! ${#unknown_deps[@]} )); then
+    echo "  (none)"
+  fi
+
+  if (( ${#aur_deps[@]} )); then
+    echo
+    read -r -p "Clone AUR dependencies now? [y/N] " reply
+    if [[ "${reply,,}" == "y" ]]; then
+      for dep in "${aur_deps[@]}"; do
+        local dpath
+        if dpath="$(clone_pkg "$dep")"; then
+          show_menu_for_pkg "$dep" "$dpath"
+        else
+          echo "Failed to clone $dep" >&2
+        fi
+      done
+    fi
+  fi
+
+  if (( ${#unknown_deps[@]} )); then
+    echo
+    echo "Some dependencies could not be resolved automatically."
+  fi
+}
+
+show_metadata() {
+  local pkg="$1"
+  local dest="$2"
+  local srcinfo=""
+  local tmp_srcinfo=""
+
+  if ! prepare_srcinfo "$dest" srcinfo tmp_srcinfo "Generating .SRCINFO to inspect metadata..."; then
+    return 1
+  fi
+
+  awk -F' = ' '
+    function trim_key(key) {
+      sub(/^[[:space:]]+/, "", key)
+      return key
+    }
+
+    function join(arr, n, sep,    out, i) {
+      out = ""
+      for (i = 1; i <= n; ++i) {
+        if (arr[i] == "") {
+          continue
+        }
+        if (out != "") {
+          out = out sep arr[i]
+        } else {
+          out = arr[i]
+        }
+      }
+      return out
+    }
+
+    function print_list(label, arr, n) {
+      if (n == 0) {
+        return
+      }
+      printf "  %-12s %s\n", label, join(arr, n, ", ")
+    }
+
+    {
+      key = trim_key($1)
+      val = $2
+
+      if (key == "pkgbase") {
+        pkgbase = val
+      } else if (key == "pkgname") {
+        pkgnames[++np] = val
+      } else if (key == "pkgver") {
+        pkgver = val
+      } else if (key == "pkgrel") {
+        pkgrel = val
+      } else if (key == "epoch") {
+        epoch = val
+      } else if (key == "pkgdesc" && pkgdesc == "") {
+        pkgdesc = val
+      } else if (key == "url" && url == "") {
+        url = val
+      } else if (key == "arch") {
+        archs[++na] = val
+      } else if (key == "license") {
+        licenses[++nl] = val
+      } else if (key == "groups") {
+        groups[++ng] = val
+      } else if (key == "provides") {
+        provides[++nprov] = val
+      } else if (key == "conflicts") {
+        conflicts[++nconf] = val
+      } else if (key == "replaces") {
+        replaces[++nrepl] = val
+      } else if (key == "depends") {
+        depends[++ndep] = val
+      } else if (key == "makedepends") {
+        makedep[++nmake] = val
+      } else if (key == "checkdepends") {
+        checkdep[++ncheck] = val
+      } else if (key == "optdepends") {
+        optdep[++nopt] = val
+      }
+    }
+
+    END {
+      printf "Metadata for %s:\n", pkg
+      if (pkgbase != "") {
+        printf "  %-12s %s\n", "pkgbase", pkgbase
+      }
+      if (np > 0) {
+        printf "  %-12s %s\n", "pkgname(s)", join(pkgnames, np, ", ")
+      }
+
+      version = ""
+      if (pkgver != "" && pkgrel != "") {
+        version = pkgver "-" pkgrel
+        if (epoch != "") {
+          version = epoch ":" version
+        }
+      }
+      if (version != "") {
+        printf "  %-12s %s\n", "version", version
+      }
+
+      if (pkgdesc != "") {
+        printf "  %-12s %s\n", "desc", pkgdesc
+      }
+      if (url != "") {
+        printf "  %-12s %s\n", "url", url
+      }
+
+      print_list("arch", archs, na)
+      print_list("license", licenses, nl)
+      print_list("groups", groups, ng)
+      print_list("provides", provides, nprov)
+      print_list("conflicts", conflicts, nconf)
+      print_list("replaces", replaces, nrepl)
+      print_list("depends", depends, ndep)
+      print_list("makedepends", makedep, nmake)
+      print_list("checkdepends", checkdep, ncheck)
+      print_list("optdepends", optdep, nopt)
+    }
+  ' pkg="$pkg" "$srcinfo"
+
+  if [[ -n "$tmp_srcinfo" ]]; then
+    rm -f "$tmp_srcinfo"
+  fi
+}
+
 clone_pkg() {
   local pkg="$1"
   local dest="$OUT_DIR/$pkg"
@@ -36,6 +296,31 @@ clone_pkg() {
   printf 'Cloning %s -> %s\n' "$pkg" "$dest" >&2
   git clone --quiet --branch "$pkg" --single-branch "$AUR_GIT_URL" "$dest" >&2
   echo "$dest"
+}
+
+push_pkg_changes() {
+  local dest="$1"
+  ( cd "$dest" || return 1
+
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "Not a git repository: $dest" >&2
+      return 1
+    fi
+
+    if ! git remote get-url "$AUR_PUSH_REMOTE" >/dev/null 2>&1; then
+      echo "Remote '$AUR_PUSH_REMOTE' is not configured for $dest." >&2
+      echo "Use 'git remote add $AUR_PUSH_REMOTE <url>' to enable pushes." >&2
+      return 1
+    fi
+
+    echo "Pushing $(git rev-parse --abbrev-ref HEAD) to $AUR_PUSH_REMOTE..."
+    if git push "$AUR_PUSH_REMOTE"; then
+      echo "Push complete."
+    else
+      echo "git push failed." >&2
+      return 1
+    fi
+  )
 }
 
 pick_pkgbuild_variant() {
@@ -59,7 +344,7 @@ show_menu_for_pkg() {
   echo "=== $pkg ==="
   echo "$dest"
   while :; do
-    echo "Choose: [v]iew PKGBUILD  [s].SRCINFO  [e]dit  [p]ick PKGBUILD  [u]pdate  [g]en .SRCINFO  [b]uild  [i]nstall  [c]lean  [q]uit"
+    echo "Choose: [v]iew PKGBUILD  [s].SRCINFO  [e]dit  [p]ick PKGBUILD  [u]pdate  [g]en .SRCINFO  [m]eta  [d]eps  [b]uild  [i]nstall  [c]lean  [push] Push  [q]uit"
     read -r -p "> " choice
     case "${choice,,}" in
       v)
@@ -92,6 +377,12 @@ show_menu_for_pkg() {
       g)
         ( cd "$dest" && makepkg --printsrcinfo > .SRCINFO && echo "Generated .SRCINFO" )
         ;;
+      m)
+        show_metadata "$pkg" "$dest"
+        ;;
+      d)
+        handle_dependencies "$pkg" "$dest"
+        ;;
       b)
         ( cd "$dest" && makepkg -sf )
         ;;
@@ -101,6 +392,9 @@ show_menu_for_pkg() {
       c)
         ( cd "$dest" && rm -rf src pkg *.pkg.tar.* *.log )
         echo "Cleaned build artifacts."
+        ;;
+      push)
+        push_pkg_changes "$dest"
         ;;
       q|"" )
         break
@@ -155,7 +449,7 @@ prompt_and_clone_then_menu() {
 
 for term in "$@"; do
   echo "Searching for: $term"
-  readarray -t MATCHES < <(printf "%s\n" "${ALL_BRANCHES[@]}" | grep -i -- "$term" || true)
+  readarray -t MATCHES < <(printf "%s\n" "${ALL_BRANCHES[@]}" | grep -Fi -- "$term" || true)
   prompt_and_clone_then_menu "${MATCHES[@]}"
 done
 
