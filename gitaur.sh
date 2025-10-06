@@ -18,6 +18,13 @@ usage() {
 command -v git >/dev/null || { echo "git not found"; exit 1; }
 command -v makepkg >/dev/null || { echo "makepkg not found (install base-devel)"; exit 1; }
 
+HAVE_PACMAN=0
+if command -v pacman >/dev/null 2>&1; then
+  HAVE_PACMAN=1
+fi
+
+declare -A INSTALLED_PKG_CACHE=()
+
 [[ $# -gt 0 ]] || usage
 
 # --- Fetch all branch names once (strip refs/heads/) ---
@@ -30,6 +37,43 @@ declare -A AUR_BRANCH_LOOKUP=()
 for _branch in "${ALL_BRANCHES[@]}"; do
   AUR_BRANCH_LOOKUP["$_branch"]=1
 done
+
+get_installed_version() {
+  local pkg="$1"
+  local __out_var="$2"
+
+  (( HAVE_PACMAN )) || return 1
+
+  if [[ -v "INSTALLED_PKG_CACHE[$pkg]" ]]; then
+    local cached="${INSTALLED_PKG_CACHE[$pkg]}"
+    if [[ "$cached" == "__not_installed" ]]; then
+      return 1
+    fi
+    printf -v "$__out_var" '%s' "$cached"
+    return 0
+  fi
+
+  local version
+  if version="$(pacman -Qi -- "$pkg" 2>/dev/null | awk -F': *' '$1 == "Version" {print $2; exit}')" && [[ -n "$version" ]]; then
+    INSTALLED_PKG_CACHE["$pkg"]="$version"
+    printf -v "$__out_var" '%s' "$version"
+    return 0
+  fi
+
+  INSTALLED_PKG_CACHE["$pkg"]="__not_installed"
+  return 1
+}
+
+format_pkg_with_status() {
+  local pkg="$1"
+  local version
+
+  if get_installed_version "$pkg" version; then
+    printf '%s (installed: %s)' "$pkg" "$version"
+  else
+    printf '%s' "$pkg"
+  fi
+}
 
 prepare_srcinfo() {
   local dest="$1"
@@ -293,9 +337,43 @@ clone_pkg() {
     echo "$dest"
     return 0
   fi
+  if [[ -e "$dest" && ! -d "$dest/.git" ]]; then
+    printf 'Cannot clone %s: destination exists but is not a git repo (%s)\n' "$pkg" "$dest" >&2
+    return 1
+  fi
   printf 'Cloning %s -> %s\n' "$pkg" "$dest" >&2
-  git clone --quiet --branch "$pkg" --single-branch "$AUR_GIT_URL" "$dest" >&2
-  echo "$dest"
+  if git clone --quiet --branch "$pkg" --single-branch "$AUR_GIT_URL" "$dest" >&2; then
+    echo "$dest"
+  else
+    local status=$?
+    printf 'Failed to clone %s (git exited with %d)\n' "$pkg" "$status" >&2
+    return "$status"
+  fi
+}
+
+push_pkg_changes() {
+  local dest="$1"
+  ( cd "$dest" || return 1
+
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "Not a git repository: $dest" >&2
+      return 1
+    fi
+
+    if ! git remote get-url "$AUR_PUSH_REMOTE" >/dev/null 2>&1; then
+      echo "Remote '$AUR_PUSH_REMOTE' is not configured for $dest." >&2
+      echo "Use 'git remote add $AUR_PUSH_REMOTE <url>' to enable pushes." >&2
+      return 1
+    fi
+
+    echo "Pushing $(git rev-parse --abbrev-ref HEAD) to $AUR_PUSH_REMOTE..."
+    if git push "$AUR_PUSH_REMOTE"; then
+      echo "Push complete."
+    else
+      echo "git push failed." >&2
+      return 1
+    fi
+  )
 }
 
 push_pkg_changes() {
@@ -340,9 +418,23 @@ pick_pkgbuild_variant() {
 show_menu_for_pkg() {
   local pkg="$1"
   local dest="$2"
+  if [[ ! -d "$dest" ]]; then
+    printf 'Package directory not available: %s\n' "$dest" >&2
+    return 1
+  fi
   echo
   echo "=== $pkg ==="
   echo "$dest"
+  if (( HAVE_PACMAN )); then
+    local installed_version=""
+    if get_installed_version "$pkg" installed_version; then
+      echo "Status: installed ($installed_version)"
+    else
+      echo "Status: not installed"
+    fi
+  else
+    echo "(pacman not found; install status unavailable.)"
+  fi
   while :; do
     echo "Choose: [v]iew PKGBUILD  [s].SRCINFO  [e]dit  [p]ick PKGBUILD  [u]pdate  [g]en .SRCINFO  [m]eta  [d]eps  [b]uild  [i]nstall  [c]lean  [push] Push  [q]uit"
     read -r -p "> " choice
@@ -413,25 +505,32 @@ prompt_and_clone_then_menu() {
   case "$count" in
     0) echo "No matches."; return;;
     1)
-      echo "1 match: ${matches[0]}"
+      echo "1 match: $(format_pkg_with_status "${matches[0]}")"
       read -r -p "Clone/use and open menu? [y/N] " yn
       if [[ "${yn,,}" == "y" ]]; then
-        local d; d="$(clone_pkg "${matches[0]}")"
-        show_menu_for_pkg "${matches[0]}" "$d"
+        local d
+        if d="$(clone_pkg "${matches[0]}")"; then
+          show_menu_for_pkg "${matches[0]}" "$d"
+        else
+          echo "Skipping ${matches[0]} due to clone failure." >&2
+        fi
       fi
       return
       ;;
   esac
 
   echo "Found $count matches:"
-  for i in "${!matches[@]}"; do printf "%3d) %s\n" "$((i+1))" "${matches[$i]}"; done
+  for i in "${!matches[@]}"; do printf "%3d) %s\n" "$((i+1))" "$(format_pkg_with_status "${matches[$i]}")"; done
   echo
   read -r -p "Choose numbers (e.g. 1 4 7), 'a' for all, or Enter to skip: " choice
   [[ -z "$choice" ]] && return
   if [[ "$choice" =~ ^[Aa]$ ]]; then
     for pkg in "${matches[@]}"; do
-      d="$(clone_pkg "$pkg")"
-      show_menu_for_pkg "$pkg" "$d"
+      if d="$(clone_pkg "$pkg")"; then
+        show_menu_for_pkg "$pkg" "$d"
+      else
+        echo "Skipping $pkg due to clone failure." >&2
+      fi
     done
     return
   fi
@@ -439,8 +538,11 @@ prompt_and_clone_then_menu() {
   for idx in $choice; do
     if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=count )); then
       pkg="${matches[$((idx-1))]}"
-      d="$(clone_pkg "$pkg")"
-      show_menu_for_pkg "$pkg" "$d"
+      if d="$(clone_pkg "$pkg")"; then
+        show_menu_for_pkg "$pkg" "$d"
+      else
+        echo "Skipping $pkg due to clone failure." >&2
+      fi
     else
       echo "Invalid selection: $idx"
     fi
