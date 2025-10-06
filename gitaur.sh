@@ -105,12 +105,6 @@ format_pkg_with_status() {
       joined+=", $tag"
     done
     printf '%s [%s]' "$pkg" "$joined"
-format_pkg_with_status() {
-  local pkg="$1"
-  local version
-
-  if get_installed_version "$pkg" version; then
-    printf '%s (installed: %s)' "$pkg" "$version"
   else
     printf '%s' "$pkg"
   fi
@@ -152,25 +146,27 @@ handle_dependencies() {
 
   local -A seen=()
   local -a deps=()
-  while IFS= read -r dep; do
+
+  local line=""
+  local dep=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ $line =~ ^(depends|makedepends|checkdepends|optdepends)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+
+    dep="${BASH_REMATCH[2]}"
+    dep="${dep%%#*}"
+    dep="${dep//[[:space:]]/}"
+    dep="${dep%%:*}"
+    dep="${dep%%[<>=!]*}"
+    dep="${dep%%\?*}"
+
     [[ -z "$dep" ]] && continue
+
     if [[ -z "${seen[$dep]:-}" ]]; then
       deps+=("$dep")
       seen["$dep"]=1
     fi
-  done < <(
-    awk -F' = ' '
-      $1 ~ /^(depends|makedepends|checkdepends|optdepends)$/ {
-        dep = $2
-        gsub(/#.*/, "", dep)
-        gsub(/[[:space:]]+/, "", dep)
-        sub(/:.*/, "", dep)
-        sub(/[<>=!].*/, "", dep)
-        sub(/\?.*/, "", dep)
-        if (dep != "") print dep
-      }
-    ' "$srcinfo"
-  )
+  done <"$srcinfo"
 
   if [[ -n "$tmp_srcinfo" ]]; then
     rm -f "$tmp_srcinfo"
@@ -179,10 +175,6 @@ handle_dependencies() {
   (( ${#deps[@]} )) || { echo "No dependencies declared in .SRCINFO."; return 0; }
 
   local have_pacman=$HAVE_PACMAN
-  local have_pacman=0
-  if command -v pacman >/dev/null 2>&1; then
-    have_pacman=1
-  fi
 
   if (( ! have_pacman )); then
     echo "(pacman not found; repo availability checks skipped.)"
@@ -191,10 +183,8 @@ handle_dependencies() {
   local -a repo_deps=()
   local -a aur_deps=()
   local -a unknown_deps=()
-  local dep
   for dep in "${deps[@]}"; do
     if (( have_pacman )) && is_repo_package "$dep"; then
-    if (( have_pacman )) && pacman -Si -- "$dep" >/dev/null 2>&1; then
       repo_deps+=("$dep")
     elif [[ -n "${AUR_BRANCH_LOOKUP[$dep]:-}" ]]; then
       aur_deps+=("$dep")
@@ -208,21 +198,18 @@ handle_dependencies() {
     printf '  Repo (%d):\n' "${#repo_deps[@]}"
     for dep in "${repo_deps[@]}"; do
       printf '    - %s\n' "$(format_pkg_with_status "$dep")"
-      printf '    - %s\n' "$dep"
     done
   fi
   if (( ${#aur_deps[@]} )); then
     printf '  AUR (%d):\n' "${#aur_deps[@]}"
     for dep in "${aur_deps[@]}"; do
       printf '    - %s\n' "$(format_pkg_with_status "$dep")"
-      printf '    - %s\n' "$dep"
     done
   fi
   if (( ${#unknown_deps[@]} )); then
     printf '  Unknown (%d):\n' "${#unknown_deps[@]}"
     for dep in "${unknown_deps[@]}"; do
       printf '    - %s\n' "$(format_pkg_with_status "$dep")"
-      printf '    - %s\n' "$dep"
     done
   fi
 
@@ -395,31 +382,6 @@ clone_pkg() {
     printf 'Failed to clone %s (git exited with %d)\n' "$pkg" "$status" >&2
     return "$status"
   fi
-}
-
-push_pkg_changes() {
-  local dest="$1"
-  ( cd "$dest" || return 1
-
-    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      echo "Not a git repository: $dest" >&2
-      return 1
-    fi
-
-    if ! git remote get-url "$AUR_PUSH_REMOTE" >/dev/null 2>&1; then
-      echo "Remote '$AUR_PUSH_REMOTE' is not configured for $dest." >&2
-      echo "Use 'git remote add $AUR_PUSH_REMOTE <url>' to enable pushes." >&2
-      return 1
-    fi
-
-    echo "Pushing $(git rev-parse --abbrev-ref HEAD) to $AUR_PUSH_REMOTE..."
-    if git push "$AUR_PUSH_REMOTE"; then
-      echo "Push complete."
-    else
-      echo "git push failed." >&2
-      return 1
-    fi
-  )
 }
 
 push_pkg_changes() {
