@@ -9,8 +9,6 @@ AUR repo is under attack and it's making it near impossible to manage packages. 
 - Explore complex dependency graphs with the `[d]eps` inspector, clone missing AUR dependencies, and classify repo/AUR/unknown packages.
 - Detect already-installed packages and surface their versions in search results, dependency listings, and the package menu header.
 - Tag entries with their repository origin (repo vs. AUR) so installed and upstream status are easy to spot while browsing.
-- Detect already-installed packages and surface their versions in search results, dependency listings, and the package menu header
-
 - Push local changes to a configurable remote (default `aur`) with the `[push]` action after adding your authenticated remote.
 
 ## Environment variables
