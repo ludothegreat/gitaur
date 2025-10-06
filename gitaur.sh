@@ -54,8 +54,16 @@ get_installed_version() {
     return 0
   fi
 
-  local version
-  if version="$(pacman -Qi -- "$pkg" 2>/dev/null | awk -F': *' '$1 == "Version" {print $2; exit}')" && [[ -n "$version" ]]; then
+  local version=""
+  local q_output=""
+
+  if q_output="$(pacman -Q -- "$pkg" 2>/dev/null)"; then
+    version="${q_output#* }"
+  else
+    version="$(pacman -Qi -- "$pkg" 2>/dev/null | awk -F': *' '$1 == "Version" {print $2; exit}')"
+  fi
+
+  if [[ -n "$version" ]]; then
     INSTALLED_PKG_CACHE["$pkg"]="$version"
     printf -v "$__out_var" '%s' "$version"
     return 0
