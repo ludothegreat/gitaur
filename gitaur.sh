@@ -513,14 +513,20 @@ prompt_and_clone_then_menu() {
   case "$count" in
     0) echo "No matches."; return;;
     1)
-      echo "1 match: $(format_pkg_with_status "${matches[0]}")"
+      local single_pkg="${matches[0]}"
+      local single_note=""
+      local _ver=""
+      if get_installed_version "$single_pkg" _ver; then
+        single_note=" (installed)"
+      fi
+      echo "1 match: $(format_pkg_with_status "$single_pkg")$single_note"
       read -r -p "Clone/use and open menu? [y/N] " yn
       if [[ "${yn,,}" == "y" ]]; then
         local d
-        if d="$(clone_pkg "${matches[0]}")"; then
-          show_menu_for_pkg "${matches[0]}" "$d"
+        if d="$(clone_pkg "$single_pkg")"; then
+          show_menu_for_pkg "$single_pkg" "$d"
         else
-          echo "Skipping ${matches[0]} due to clone failure." >&2
+          echo "Skipping $single_pkg due to clone failure." >&2
         fi
       fi
       return
@@ -528,7 +534,15 @@ prompt_and_clone_then_menu() {
   esac
 
   echo "Found $count matches:"
-  for i in "${!matches[@]}"; do printf "%3d) %s\n" "$((i+1))" "$(format_pkg_with_status "${matches[$i]}")"; done
+  for i in "${!matches[@]}"; do
+    local pkg="${matches[$i]}"
+    local installed_note=""
+    local _ver=""
+    if get_installed_version "$pkg" _ver; then
+      installed_note=" (installed)"
+    fi
+    printf "%3d) %s%s\n" "$((i+1))" "$(format_pkg_with_status "$pkg")" "$installed_note"
+  done
   echo
   read -r -p "Choose numbers (e.g. 1 4 7), 'a' for all, or Enter to skip: " choice
   [[ -z "$choice" ]] && return
